@@ -204,3 +204,104 @@ with state_totals as (
 SELECT state, 
   revenue/state_revenue as percent_of_state_revenue
 FROM state_totals;
+  
+## An ETL script to see if test orders converted to a real purchase 
+  
+  DROP TABLE IF EXISTS ol.sp_orders;
+
+CREATE TABLE ol.sp_orders (
+    number                         TEXT,
+    email                          TEXT,
+    completed_at                   TIMESTAMP,
+    next_order_date                TIMESTAMP,
+    preceding_order_date           TIMESTAMP,
+    hto_conversion_id              TEXT,
+    hto_conversion                 BOOLEAN,
+    hto_conversion_days            INTERVAL,
+    paid_order_was_preceded_by_hto BOOLEAN,
+    conversion_days                INTERVAL
+);
+
+WITH order_pre_processing AS (
+    SELECT *,
+           CONCAT(channel, '-', payment_state, '-', CASE
+                                                        WHEN LOWER(s.overall_status) IN
+                                                             ('shipped', 'sent', 'shipped_to_store', 'complete',
+                                                              'production', 'processing', 'info_incomplete',
+                                                              'delivered') THEN 'other'
+                                                        ELSE 'new' END) AS statuses_grouped
+    FROM dl_solidus.spree_orders o
+             LEFT JOIN dl_solidus.spree_order_statuses s
+                       ON o.id = s.order_id
+    WHERE completed_at IS NOT NULL
+      AND number NOT LIKE '%-E'
+),
+     valid_orders AS (
+         SELECT *
+         FROM order_pre_processing
+         WHERE statuses_grouped IN
+               ('spree-balance_due-other', 'spree-credit_owed-other', 'spree-credit_owed-new', 'spree-paid-new',
+                'spree-paid-other', 'spree-refunded-new', 'spree-refunded-other')
+     ),
+     base AS (
+         SELECT number,
+                email,
+                completed_at,
+                number LIKE '%-T'     AS hto_order,
+                number NOT LIKE '%-T' AS paid_order
+         FROM valid_orders
+     ),
+     lead_base AS
+         (SELECT number,
+                 email,
+                 completed_at,
+                 hto_order,
+                 paid_order,
+                 LEAD(completed_at)
+                 OVER (
+                     PARTITION BY email
+                     ORDER BY completed_at )            AS next_order_date,
+                 LAG(completed_at)
+                 OVER (
+                     PARTITION BY email
+                     ORDER BY completed_at )            AS preceding_order_date,
+                 LEAD(number)
+                 OVER (
+                     PARTITION BY email
+                     ORDER BY completed_at )            AS lead_invoice_id,
+                 LAG(number)
+                 OVER (
+                     PARTITION BY email
+                     ORDER BY completed_at )            AS lag_invoice_id,
+                 LEAD(hto_order)
+                 OVER (
+                     PARTITION BY email
+                     ORDER BY completed_at ) :: BOOLEAN AS lead_hto_order,
+                 LAG(paid_order)
+                 OVER (
+                     PARTITION BY email
+                     ORDER BY completed_at ) :: BOOLEAN AS lag_paid_order
+
+          FROM base
+          ORDER BY 1, 2
+         )
+
+INSERT
+INTO ol.sp_orders (number, email, completed_at, next_order_date, preceding_order_date, hto_conversion_id,
+                   hto_conversion, hto_conversion_days, paid_order_was_preceded_by_hto, conversion_days)
+
+SELECT number,
+       email,
+       completed_at,
+       next_order_date,
+       preceding_order_date,
+       CASE WHEN hto_order THEN lead_invoice_id END                                               AS hto_conversion_id,
+       (hto_order AND NOT lead_hto_order)                                                         AS hto_conversion,
+       CASE WHEN (hto_order AND NOT lead_hto_order)
+               THEN next_order_date - completed_at END                                            as hto_conversion_days,
+       (paid_order AND NOT lag_paid_order)                                                        AS paid_order_was_preceded_by_hto,
+       CASE WHEN (paid_order AND NOT lag_paid_order) THEN completed_at - preceding_order_date END as conversion_days
+FROM lead_base
+ORDER BY 2, 3
+;
+
