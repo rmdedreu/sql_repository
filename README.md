@@ -304,4 +304,14 @@ SELECT number,
 FROM lead_base
 ORDER BY 2, 3
 ;
+  
+## window function first value, first name of car 
+  
+ SELECT 
+   FIRST_VALUE(name) OVER(PARTITION BY model, year ORDER BY date_at_lot ASC) AS oldest_car_name
+   model,
+   year
+FROM cars
+  
+Doing this will result in the function outputting the name of the first car. You can specify any column here, but the name makes the most sense since it is unique across the model and year. 
 
